@@ -237,6 +237,16 @@ implemented and covered by deterministic tests (`tests/`), including session
 recovery, provider/protocol classification, lifecycle, concurrency, migrations,
 and STDIO protocol cleanliness. Tests never call the paid Claude API.
 
+## License
+
+Licensed under the [Non-Commercial Reciprocal Source License 1.0](LICENSE):
+non-commercial use only, attribution required, and distributed, derived, or
+network-served Covered Works must publish their Corresponding Source under the
+same license. Commercial use requires separate prior written permission.
+
+Because commercial use is prohibited, this is a **source-available** license,
+not an OSI-approved open-source license.
+
 ## Official references
 
 - MCP Specification: https://modelcontextprotocol.io/specification/

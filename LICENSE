@@ -1,0 +1,85 @@
+Non-Commercial Reciprocal Source License 1.0
+
+Copyright (c) 2026 zjgxkj
+
+This license applies to the software and documentation in this repository that
+are owned by the copyright holder (the "Software"). Third-party components
+remain subject to their own licenses.
+
+1. Definitions
+
+"Covered Work" means the Software and any work that copies, modifies,
+translates, adapts, or incorporates a copyrightable portion of the Software.
+Mere aggregation with an independent work does not make that independent work a
+Covered Work.
+
+"Corresponding Source" means the preferred form for making modifications,
+including the source code and the scripts and configuration needed to build,
+install, and run the Covered Work. It does not include generally available
+tools or unmodified third-party dependencies.
+
+"Commercial Use" means use intended for or directed toward commercial
+advantage or monetary compensation. It includes use by or for a for-profit
+entity, internal business use, paid products or services, revenue-supported
+services, resale, relicensing, and hosting or software-as-a-service offerings.
+
+2. Non-Commercial Grant
+
+Subject to these terms, the copyright holder grants you a worldwide,
+non-exclusive, royalty-free license to use, copy, modify, and distribute the
+Software solely for purposes that are not Commercial Use.
+
+3. Attribution and Notices
+
+Every copy or substantial portion of the Software must retain this license,
+the copyright notice above, and a reasonable attribution to the original
+project. Modified versions must state prominently that they were modified.
+
+4. Reciprocal Source Requirement
+
+If you distribute a Covered Work, make it available to another person or
+entity, or let another person or entity interact with it remotely over a
+network, you must at the same time:
+
+  a. make its complete Corresponding Source publicly available at no charge;
+  b. license that Corresponding Source and the Covered Work under this same
+     license, without additional restrictions; and
+  c. provide a prominent link or other clear instructions for obtaining the
+     Corresponding Source.
+
+The Corresponding Source must remain available for as long as the Covered Work
+is made available and for at least three years after the last such availability.
+
+5. Commercial Licensing
+
+Commercial Use is prohibited unless the copyright holder gives prior written
+permission under a separate commercial license. Nothing in this license
+requires the copyright holder to offer such a license.
+
+6. No Trademark Rights
+
+This license does not grant permission to use names, logos, or trademarks except
+as reasonably necessary for attribution.
+
+7. Statutory Rights
+
+This license does not restrict fair use, fair dealing, or any other use that
+applicable law permits without a copyright license.
+
+8. Termination
+
+Your rights under this license terminate automatically when you violate its
+terms. If this is your first violation and you cure it within 30 days after
+receiving written notice, your rights are reinstated retroactively. Otherwise,
+reinstatement requires written permission from the copyright holder.
+
+9. Disclaimer of Warranty and Limitation of Liability
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+PURPOSE, AND NON-INFRINGEMENT. TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE
+COPYRIGHT HOLDER WILL NOT BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY
+ARISING FROM THE SOFTWARE OR ITS USE.
+
+This is a source-available license, not an Open Source Initiative approved
+open-source license.

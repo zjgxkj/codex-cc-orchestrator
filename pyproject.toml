@@ -1,8 +1,10 @@
 [project]
 name = "codex-claude-agent-mcp"
 version = "0.3.0"
-description = "STDIO MCP server that lets Codex/Sol delegate scoped coding tasks to Claude Code via the Claude Agent SDK."
+description = "STDIO MCP server that lets Codex delegate scoped coding tasks to Claude Code via the Claude Agent SDK."
 readme = "README.md"
+license = "LicenseRef-NonCommercial-Reciprocal-Source-1.0"
+license-files = ["LICENSE"]
 authors = [
     { name = "Project contributors" }
 ]
