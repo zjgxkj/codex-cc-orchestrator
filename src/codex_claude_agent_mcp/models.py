@@ -13,7 +13,10 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints, model_validator
+
+from .usage import Usage, JobUsage
+from .compact import compact_payload, compact_error
 
 
 JobId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
@@ -29,6 +32,14 @@ Effort = Literal["low", "medium", "high", "xhigh", "max"]
 # --- Error ------------------------------------------------------------------
 
 class ErrorInfo(BaseModel):
+    output_truncated: bool = False
+    omitted: dict[str, int] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def bound(cls, value):
+        return compact_error(value) if isinstance(value, dict) else value
+
     code: str
     message: str
     retryable: bool = False
@@ -47,6 +58,7 @@ ProjectRoot = Annotated[PathText, Field(description=_PROJECT_ROOT_DESC)]
 
 
 class ExecuteTaskInput(BaseModel):
+    background: bool = False
     job_id: JobId = Field(..., description="Stable identifier for this job within the MCP instance.")
     task: TaskText = Field(..., description="The already-scoped coding task to execute.")
     cwd: PathText = Field(..., description="Absolute working directory; must be under project_root when supplied, otherwise under ALLOWED_PROJECT_ROOTS.")
@@ -114,7 +126,27 @@ class RunJobsInput(BaseModel):
 
 # --- Results ----------------------------------------------------------------
 
-class ExecuteTaskResult(BaseModel):
+class WorkerResult(BaseModel):
+    @model_validator(mode="before")
+    @classmethod
+    def bound(cls, value):
+        if not isinstance(value, dict):
+            return value
+        result = compact_payload(value, "review" if cls.__name__ == "ReviewTaskResult" else "execution")
+        error = result.get("error")
+        if error:
+            error = ErrorInfo.model_validate(error)
+            result["error"] = error
+            if error.output_truncated:
+                result["output_truncated"] = True
+                result["omitted"]["error"] = 1
+        return result
+
+
+class ExecuteTaskResult(WorkerResult):
+    usage: Usage | None = None
+    output_truncated: bool = False
+    omitted: dict[str, int] = Field(default_factory=dict)
     job_id: str
     status: str | None = None  # COMPLETED | BLOCKED | FAILED | None (input error)
     execution_completed: bool = False
@@ -126,7 +158,10 @@ class ExecuteTaskResult(BaseModel):
     error: ErrorInfo | None = None
 
 
-class ReviewTaskResult(BaseModel):
+class ReviewTaskResult(WorkerResult):
+    usage: Usage | None = None
+    output_truncated: bool = False
+    omitted: dict[str, int] = Field(default_factory=dict)
     job_id: str
     status: str | None = None  # PASS | FAIL | FAILED | None (input error)
     review_session_id: str | None = None
@@ -141,7 +176,10 @@ class ReviewTaskResult(BaseModel):
     error: ErrorInfo | None = None
 
 
-class ContinueTaskResult(BaseModel):
+class ContinueTaskResult(WorkerResult):
+    usage: Usage | None = None
+    output_truncated: bool = False
+    omitted: dict[str, int] = Field(default_factory=dict)
     job_id: str
     status: str | None = None  # COMPLETED | BLOCKED | FAILED
     execution_completed: bool = False
@@ -167,8 +205,26 @@ class RunJobResult(BaseModel):
 
 class JobStatusResult(BaseModel):
     """Persisted job state for post-timeout recovery (no Claude call)."""
+    @model_validator(mode="before")
+    @classmethod
+    def bound_legacy(cls, value):
+        if isinstance(value, dict):
+            value = dict(value)
+            for stage in ("execution", "review"):
+                summary = value.get(stage + "_summary")
+                if isinstance(summary, str) and len(summary) > 3000:
+                    value[stage + "_summary"] = summary[:3000]
+                    value["output_truncated"] = True
+                    value.setdefault("omitted", {})[stage + "_summary_chars"] = len(summary) - 3000
+        return value
+
+    output_truncated: bool = False
+    omitted: dict[str, int] = Field(default_factory=dict)
     job_id: str
     found: bool = False
+    usage: JobUsage | None = None
+    execution_result: ExecuteTaskResult | None = None
+    review_result: ReviewTaskResult | None = None
     status: str | None = None
     execution_status: str | None = None
     review_status: str | None = None

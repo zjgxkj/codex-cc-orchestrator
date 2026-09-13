@@ -1,6 +1,6 @@
 [project]
 name = "codex-claude-agent-mcp"
-version = "0.3.0"
+version = "0.4.0"
 description = "点将台：Codex 将明确任务委派给 Claude Code 执行与独立审查的 STDIO MCP 多智能体编排器。"
 readme = "README.md"
 keywords = [

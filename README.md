@@ -18,6 +18,9 @@ Agent；独立 Reviewer 检查实质变更，最后由上游 Agent 验收用户�
 
 ## 功能与用途
 
+**当前版本 v0.4.0**：[方案与边界](docs/V0.4.md)。新增逐次用量记录（不含价格）、
+确定性结果压缩和 `execute_task(background=true)` 后台提交；核心分工不变。
+
 - **能力分工**：高判断任务留给主脑，明确且可验证的工作包交给执行 Agent。
 - **工程执行**：覆盖功能实现、Bug 根因排查、重构、测试、算法、迁移和建模工作。
 - **连续会话**：保存并确认 execution session，可带反馈恢复原执行上下文。
@@ -40,7 +43,7 @@ Codex（主脑 / MCP Client）
 
 | 工具 | 用途 |
 | --- | --- |
-| `execute_task` | 让执行 Agent 完成明确任务并返回 execution session；不自动 Review。 |
+| `execute_task` | 默认同步；`background=true` 提交后立即返回，由 `get_job_status` 查结果；不自动 Review。 |
 | `review_task` | 用全新只读会话按 acceptance 独立判定 PASS/FAIL。 |
 | `continue_task` | 把反馈送回原 execution session 继续修复。 |
 | `run_job` | 按要求执行 execute → 可选 review。 |
@@ -84,6 +87,7 @@ Server 在启动执行或审查前分配 UUID，只有执行端回报相同 sess
 ```bash
 git clone https://github.com/zjgxkj/codex-claude-agent-mcp.git
 cd codex-claude-agent-mcp
+git checkout v0.4.0
 uv sync
 ```
 
@@ -243,12 +247,11 @@ Tool Result，也可以使用；客户端必须为新 Job 提供可信 `project_
 task、review 和 resume。更换主脑或执行端时见
 [AGENT_PORTING.md](AGENT_PORTING.md)。
 
-## Status: v0.3 hardened
+## 版本：v0.4.0
 
-See `CODEX_CLAUDE_AGENT_MCP_SPEC.md` §25 for the full checklist. All v1 items are
-implemented and covered by deterministic tests (`tests/`), including session
-recovery, provider/protocol classification, lifecycle, concurrency, migrations,
-and STDIO protocol cleanliness. Tests never call the paid Claude API.
+功能边界、统计口径、数据库迁移及验证方法见 [v0.4 定稿](docs/V0.4.md)。
+后台任务不会跨 MCP 进程重启继续运行；重启后按确认过的 session 恢复，不能把 RUNNING
+当成功。回归使用 Fake Runner / 模拟 SDK，不产生 Claude API 调用。
 
 ## License
 

@@ -26,6 +26,7 @@ import pytest
 
 _SHIM = textwrap.dedent("""
     import asyncio
+    import os
     from codex_claude_agent_mcp.claude_runner import FakeClaudeRunner
     from codex_claude_agent_mcp import server as S
 
@@ -33,7 +34,7 @@ _SHIM = textwrap.dedent("""
     async def _get_app():
         global _app
         if _app is None:
-            _app = await S.AppState.create(runner=FakeClaudeRunner())
+            _app = await S.AppState.create(runner=FakeClaudeRunner(execute_mode=os.environ.get('TEST_FAKE_MODE', 'success')))
         return _app
     S.get_app = _get_app
 
@@ -46,7 +47,7 @@ _SHIM = textwrap.dedent("""
 _UNSET = object()
 
 
-def _launch(tmp_path: Path, allowed_roots: object = _UNSET) -> subprocess.Popen:
+def _launch(tmp_path: Path, allowed_roots: object = _UNSET, fake_mode: str = 'success') -> subprocess.Popen:
     env = dict(os.environ)
     env["CODEX_CLAUDE_AGENT_MCP_DB_PATH"] = str(tmp_path / "stdio.db")
     env["CODEX_CLAUDE_AGENT_MCP_LOG_LEVEL"] = "DEBUG"
@@ -57,6 +58,7 @@ def _launch(tmp_path: Path, allowed_roots: object = _UNSET) -> subprocess.Popen:
     else:
         env["ALLOWED_PROJECT_ROOTS"] = str(allowed_roots)
     env["PYTHONUNBUFFERED"] = "1"
+    env["TEST_FAKE_MODE"] = fake_mode
     return subprocess.Popen(
         [sys.executable, "-c", _SHIM],
         stdin=subprocess.PIPE,
@@ -121,6 +123,48 @@ def _drain_stdout(proc: subprocess.Popen) -> list[str]:
         proc.kill()
     out = proc.stdout.read() if proc.stdout else ""
     return [l for l in out.splitlines() if l.strip()]
+
+
+def test_background_stdio_ack_status_schema_and_shutdown(tmp_path):
+    import sqlite3
+    import time
+    proc = _launch(tmp_path, fake_mode='slow')
+    try:
+        _initialize(proc)
+        _write(proc, {'jsonrpc':'2.0','id':80,'method':'tools/list','params':{}})
+        tools = {t['name']:t for t in _read_response(proc,80)['result']['tools']}
+        assert tools['execute_task']['inputSchema']['properties']['background']['default'] is False
+        assert 'background' not in tools['run_job']['inputSchema']['properties']
+        started=time.monotonic()
+        result=_call(proc,81,'execute_task',{'job_id':'async-stdio','task':'t',
+            'cwd':str(Path.cwd()),'background':True})['result']['structuredContent']
+        assert time.monotonic()-started < 5  # Fake slow runner waits 30 seconds.
+        assert result['status']=='QUEUED' and not result['execution_completed']
+        status=_call(proc,82,'get_job_status',{'job_id':'async-stdio',
+            'cwd':str(Path.cwd())})['result']['structuredContent']
+        assert status['status'] in {'QUEUED','EXECUTING'}
+        _call(proc,83,'ping',{})  # Same process is responsive during execution.
+        for line in _drain_stdout(proc): json.loads(line)
+        assert proc.returncode == 0
+        with sqlite3.connect(tmp_path/'stdio.db') as conn:
+            assert conn.execute("SELECT status FROM jobs WHERE job_id='async-stdio'").fetchone()[0]=='EXECUTION_INCOMPLETE'
+        assert 'Task exception was never retrieved' not in proc.stderr.read()
+    finally:
+        if proc.poll() is None: proc.kill(); proc.wait()
+
+
+def test_background_stdio_final_result(tmp_path):
+    proc=_launch(tmp_path)
+    try:
+        _initialize(proc)
+        _call(proc,90,'execute_task',{'job_id':'bg-done','task':'t','cwd':str(Path.cwd()),'background':True})
+        for req in range(91,111):
+            status=_call(proc,req,'get_job_status',{'job_id':'bg-done','cwd':str(Path.cwd())})['result']['structuredContent']
+            if status['status']=='COMPLETED': break
+        assert status['status']=='COMPLETED'
+        assert status['execution_result']['validation']==['fake test passed']
+    finally:
+        proc.stdin.close(); proc.wait(timeout=10)
 
 
 def test_stdout_is_only_mcp_protocol(tmp_path):
@@ -302,7 +346,7 @@ def test_tool_schema_and_ping_metadata(tmp_path):
         assert {"job_id", "cwd"} <= required
 
         ping = _call(proc, 71, "ping", {})["result"]["structuredContent"]
-        assert ping["version"] == "0.3.0"
+        assert ping["version"] == "0.4.0"
         assert ping["sdk_version"]
         assert ping["cli_version"]
         assert ping["max_buffer_size"] == 20 * 1024 * 1024

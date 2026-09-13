@@ -32,7 +32,7 @@ Executor validation is implementation, not a third review layer. Resume CC-1 for
 
 ## Run and recover
 
-- Use `run_job(review=true)` for a short, ready substantive package. For unknown-scope or long implementation/test work, use `execute_task`, inspect its persisted outcome, then `review_task`; `execute_task` never reviews. Use `review=false` only intentionally.
+- Use `run_job(review=true)` for short, ready substantive packages; prefer `execute_task(background=true)` for unknown-scope work, long implementations or large tests. Submit once, then check `get_job_status` with spaced polls while doing independent work; QUEUED/RUNNING/EXECUTING is not success. After COMPLETED, decide fresh review by the rules above; background never reviews automatically. Use `review=false` only intentionally.
 - On timeout or lost response, call `get_job_status(job_id, cwd)` and inspect the workspace. Continue only when `execution_session_confirmed=true`; an allocated but unconfirmed session is not resumable. Retry a transient unconfirmed execution with a new job ID. Recover `REVIEW_INCOMPLETE` with a fresh `review_task` on the same job.
 - Never retry billing 402, authentication, invalid request, or protocol/invalid-output failures unchanged. Retry transient network, timeout, rate-limit, and provider 408/5xx/529 failures only a bounded number of times.
 - Use `continue_task` while evidence and causal progress advance. If the same failure persists, changes mask symptoms/create regressions, evidence stalls, or a material reasoning issue appears, Codex takes the minimum decisive part. Transport/tool failure is not model incapability.

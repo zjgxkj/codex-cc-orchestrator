@@ -132,7 +132,7 @@ ALLOWED_PROJECT_ROOTS = 'D:\projects'
    ```
    ping()
    ```
-   返回 `{"ok": true, "pid": ..., "version": "0.3.0", ...}` 即接通；同时会给出 SDK/CLI 版本和缓冲上限，不调用 Claude 服务。
+   返回 `{"ok": true, "pid": ..., "version": "0.4.0", ...}` 即接通；同时会给出 SDK/CLI 版本和缓冲上限，不调用 Claude 服务。
 4. 跑一个真实小任务验证 Claude 链路（需要 Claude 已登录）：
    ```
    run_job(
@@ -243,6 +243,13 @@ review 与 resume 的调用顺序需由其客户端负责。
 
 ---
 
-## 8. 卸载
+## 8. 升级到 v0.4.0
+
+先等待旧任务结束并停止旧 MCP，再执行 `git fetch --tags`、`git checkout v0.4.0`、
+`uv sync`；同步仓库 Skill 后重启 Codex，使新 Tool schema 生效。
+SQLite 启动时增量迁移，无需删库。后台执行不跨 MCP 重启存活，详情见
+[v0.4 方案与恢复边界](docs/V0.4.md)。旧版无 owner 的活跃任务不会被强行接管。
+
+## 9. 卸载
 
 从 `config.toml` 删除 `[mcp_servers.codex-claude-agent]` 整段并重启 Codex 即可。可选地删除 `~/.codex-claude-agent-mcp/state.db` 与项目目录。

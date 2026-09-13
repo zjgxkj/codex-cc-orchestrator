@@ -85,6 +85,12 @@ async def test_legacy_db_is_migrated_and_readable(tmp_db_path):
         assert job["review_session_confirmed"] is True
         assert job["execution_error"] is None and job["review_error"] is None
         assert (await store.list_jobs())[0]["project_root"] is None
+        assert {"owner_id", "execution_result_json", "review_result_json"} <= _columns(tmp_db_path)
+        assert job["owner_id"] is None
+        assert job["execution_result"] is None and job["review_result"] is None
+        assert (await store.get_usage("legacy-1")).total.calls == 0
+        assert (await store.get_usage("legacy-1")).total.input_tokens is None
+        assert await store.get_invocations("legacy-1") == []
     finally:
         await store.close()
 

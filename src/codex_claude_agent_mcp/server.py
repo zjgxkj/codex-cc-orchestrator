@@ -17,6 +17,8 @@ The ``@mcp.tool`` wrappers are thin and only adapt MCP I/O.
 from __future__ import annotations
 
 import asyncio
+import contextvars
+from contextlib import asynccontextmanager
 import json
 import os
 import uuid
@@ -78,6 +80,8 @@ from .models import (
     RunJobsResult,
     TaskText,
 )
+from .compact import compact_payload
+from .ownership import ProcessOwner
 from .scheduler import Scheduler
 from .session_store import SessionStore
 
@@ -94,6 +98,9 @@ class AppState:
         self.store = store
         self.runner = runner
         self.scheduler = scheduler
+        self.owner = ProcessOwner(store.db_path)
+        self.background_tasks: set[asyncio.Task] = set()
+        self.closing = False
 
     @classmethod
     async def create(cls, config: Config | None = None, runner: ClaudeRunner | None = None) -> "AppState":
@@ -102,20 +109,55 @@ class AppState:
         await store.init()
         runner = runner or RealClaudeRunner(cli_path=config.cli_path, max_buffer_size=config.max_buffer_size)
         scheduler = Scheduler(config.max_concurrency)
-        return cls(config=config, store=store, runner=runner, scheduler=scheduler)
+        state = cls(config=config, store=store, runner=runner, scheduler=scheduler)
+        try:
+            await store.reconcile(state.owner.is_dead)
+        except BaseException:
+            state.owner.close()
+            await store.close()
+            raise
+        return state
 
     async def close(self) -> None:
-        await self.store.close()
+        if self.closing:
+            return
+        self.closing = True
+        tasks = list(self.background_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await self.store.reconcile(self.owner.is_dead, owner_id=self.owner.owner_id)
+        finally:
+            await self.store.close()
+            self.owner.close()
+
+    def spawn(self, coro, job_id: str) -> asyncio.Task:
+        # A fresh context prevents request cancellation/deadline contextvars
+        # from leaking into the detached execution.
+        task = asyncio.create_task(coro, name=f"execute:{job_id}", context=contextvars.Context())
+        self.background_tasks.add(task)
+        def done(task):
+            self.background_tasks.discard(task)
+            if not task.cancelled():
+                error = task.exception()  # Always retrieve exceptions.
+                if error:
+                    log.error("background task failed job=%s", job_id,
+                              exc_info=(type(error), error, error.__traceback__))
+        task.add_done_callback(done)
+        return task
 
 
 _app: AppState | None = None
+_app_lock = asyncio.Lock()
 
 
 async def get_app() -> AppState:
     global _app
-    if _app is None:
-        _app = await AppState.create()
-    return _app
+    async with _app_lock:
+        if _app is None:
+            _app = await AppState.create()
+        return _app
 
 
 async def set_app(app: AppState) -> None:
@@ -143,6 +185,9 @@ def _exec_to_result(job_id: str, r: ExecutionResult) -> ExecuteTaskResult:
         files_changed=r.files_changed,
         validation=r.validation,
         error=_err(r.error) if r.error else None,
+        usage=r.usage,
+        output_truncated=r.output_truncated,
+        omitted=r.omitted,
     )
 
 
@@ -160,6 +205,9 @@ def _review_to_result(job_id: str, r: ReviewResult) -> ReviewTaskResult:
         unmet_criteria=r.unmet_criteria if completed else None,
         evidence=r.evidence if completed else None,
         error=_err(r.error) if r.error else None,
+        usage=r.usage,
+        output_truncated=r.output_truncated,
+        omitted=r.omitted,
     )
 
 
@@ -224,24 +272,8 @@ def _state_conflict(job_id: str, status: str | None, operation: str) -> MCPError
 async def _mark_cancelled(app: AppState, job_id: str, expected_status: str, stage: str) -> None:
     """Best-effort stage-aware update from a cancelled request task."""
     try:
-        aggregate = "REVIEW_INCOMPLETE" if stage == "review" else "EXECUTION_INCOMPLETE"
-        changed = await asyncio.shield(app.store.transition_status(
-            job_id,
-            from_statuses={expected_status},
-            to_status=aggregate,
-        ))
-        if changed:
-            job = await asyncio.shield(app.store.get_job(job_id))
-            sid = job.get(f"{stage}_session_id") if job else None
-            confirmed = bool(job and job.get(f"{stage}_session_confirmed"))
-            err = MCPError(
-                CANCELLED, f"{stage} request was cancelled",
-                details={"stage": stage, "session_id": sid, "session_confirmed": confirmed},
-            )
-            await asyncio.shield(app.store.update_fields(job_id, **{
-                f"{stage}_status": "INCOMPLETE",
-                f"{stage}_error_json": json.dumps(err.to_dict()),
-            }))
+        await asyncio.shield(app.store.mark_cancelled(
+            job_id, expected_status, stage, app.owner.owner_id))
     except asyncio.CancelledError:
         # A second cancellation must not turn cancellation cleanup into a tool
         # failure or overwrite a state already completed by another coroutine.
@@ -272,13 +304,56 @@ def _stage_error(exc: MCPError, stage: str, session_id: str | None, confirmed: b
 
 # --- core logic (testable) --------------------------------------------------
 
+async def _invoke(app: AppState, job_id: str, operation: str, session_id: str, call):
+    """One journal row per actual runner invocation, including failed calls."""
+    stage = "review" if operation == "review" else "execution"
+    invocation_id = uuid.uuid4().hex
+    if operation == "execute":
+        await app.store.transition_status(job_id, from_statuses={"QUEUED"}, to_status="EXECUTING")
+        await app.store.update_fields(job_id, execution_status="EXECUTING")
+    await app.store.start_invocation(invocation_id, job_id, stage, operation,
+                                     session_id, app.owner.owner_id)
+    try:
+        result = await call()
+    except BaseException:
+        await asyncio.shield(app.store.finish_invocation(invocation_id, "INCOMPLETE", None))
+        raise
+    await app.store.finish_invocation(invocation_id,
+        result.status if result.completed else "INCOMPLETE", result.usage)
+    fields = ("summary", "unmet_criteria", "evidence") if stage == "review" else ("summary", "files_changed", "validation")
+    payload = compact_payload({**{key: getattr(result, key) for key in fields},
+                               "output_truncated": result.output_truncated,
+                               "omitted": result.omitted}, stage)
+    for key, value in payload.items():
+        setattr(result, key, value)
+    return result
+
+
 async def _execute_task_core(
     app: AppState, job_id: str, task: str, cwd: str,
     acceptance: list[str] | None, model: str | None,
     effort: str | None, timeout_sec: int | None,
+    project_root: str | None = None, background: bool = False,
+) -> ExecuteTaskResult:
+    coro = _execute_task_impl(app, job_id, task, cwd, acceptance, model, effort,
+                             timeout_sec, project_root, background)
+    if background:
+        # Admission is managed too: cancellation during SQLite creation must
+        # not leave a committed QUEUED job without a worker in a live process.
+        return await asyncio.shield(app.spawn(coro, job_id))
+    return await coro
+
+
+async def _execute_task_impl(
+    app: AppState, job_id: str, task: str, cwd: str,
+    acceptance: list[str] | None, model: str | None,
+    effort: str | None, timeout_sec: int | None,
     project_root: str | None = None,
+    background: bool = False,
 ) -> ExecuteTaskResult:
     cfg = app.config
+    if app.closing:
+        return ExecuteTaskResult(job_id=job_id, error=_err(MCPError(CANCELLED, "MCP is shutting down")))
     try:
         job_id = _require_text(job_id, "job_id")
         task = _require_text(task, "task")
@@ -297,26 +372,52 @@ async def _execute_task_core(
     execution_session_id = str(uuid.uuid4())
     try:
         await app.store.create_job(
-            job_id, task, acceptance, str(resolved), status="EXECUTING",
+            job_id, task, acceptance, str(resolved), status="QUEUED" if background else "EXECUTING",
+            owner_id=app.owner.owner_id,
             project_root=str(root) if root is not None else None,
-            execution_status="EXECUTING",
+            execution_status="QUEUED" if background else "EXECUTING",
             execution_session_id=execution_session_id,
         )
     except MCPError as exc:
         return ExecuteTaskResult(job_id=job_id, error=_err(exc))
 
+    if background:
+        app.spawn(_background_execute(app, job_id, task, resolved, acceptance, model,
+                                     effort, timeout, execution_session_id), job_id)
+        return ExecuteTaskResult(job_id=job_id, status="QUEUED",
+                                 execution_session_id=execution_session_id)
+    return await _execute_admitted(app, job_id, task, resolved, acceptance, model,
+                                   effort, timeout, execution_session_id)
+
+
+async def _background_execute(app, job_id, *args):
+    try:
+        await _execute_admitted(app, job_id, *args)
+    except asyncio.CancelledError:
+        await _mark_cancelled(app, job_id, "QUEUED", "execution")
+        raise
+    except Exception as exc:
+        log.exception("background execution failed job=%s", job_id)
+        await app.store.set_execution_session(
+            job_id, None, "EXECUTION_INCOMPLETE", None, execution_status="INCOMPLETE",
+            error=_err(internal_error(str(exc))).model_dump())
+
+
+async def _execute_admitted(app, job_id, task, resolved, acceptance, model, effort,
+                            timeout, execution_session_id):
     try:
         r: ExecutionResult = await app.scheduler.run(
-            lambda: app.runner.execute(
+            lambda: _invoke(app, job_id, "execute", execution_session_id, lambda: app.runner.execute(
                 task=task, cwd=str(resolved), acceptance=acceptance,
                 model=model, effort=effort, timeout_sec=timeout, job_id=job_id,
                 session_id=execution_session_id,
                 on_session_id=_session_confirmation_binding(app, job_id, "execution"),
-            ),
+            )),
             label=f"execute:{job_id}",
         )
     except asyncio.CancelledError:
         await _mark_cancelled(app, job_id, "EXECUTING", "execution")
+        await _mark_cancelled(app, job_id, "QUEUED", "execution")
         raise
     except MCPError as exc:
         stored = await app.store.get_job(job_id)
@@ -325,7 +426,7 @@ async def _execute_task_core(
         await app.store.set_execution_session(
             job_id, execution_session_id, "EXECUTION_INCOMPLETE", None,
             execution_status="INCOMPLETE", session_confirmed=confirmed,
-            error=exc.to_dict(),
+            error=_err(exc).model_dump(),
         )
         return ExecuteTaskResult(
             job_id=job_id, status="FAILED", execution_session_id=execution_session_id,
@@ -342,7 +443,7 @@ async def _execute_task_core(
         await app.store.set_execution_session(
             job_id, execution_session_id, "EXECUTION_INCOMPLETE", None,
             execution_status="INCOMPLETE", session_confirmed=confirmed,
-            error=err.to_dict(),
+            error=_err(err).model_dump(),
         )
         return ExecuteTaskResult(
             job_id=job_id, status="FAILED", execution_session_id=execution_session_id,
@@ -368,7 +469,8 @@ async def _execute_task_core(
     await app.store.set_execution_session(
         job_id, execution_session_id, overall_status, r.summary,
         execution_status=stage_status, session_confirmed=r.session_confirmed,
-        error=r.error.to_dict() if r.error else None,
+        error=_err(r.error).model_dump() if r.error else None,
+        result=_exec_to_result(job_id, r).model_dump(),
     )
     return _exec_to_result(job_id, r)
 
@@ -403,6 +505,7 @@ async def _review_task_core(
                 job_id, original_task, acceptance, str(resolved), status="REVIEWING",
                 project_root=str(supplied_root) if supplied_root is not None else None,
                 review_status="REVIEWING",
+                owner_id=app.owner.owner_id,
                 review_session_id=review_session_id,
             )
         except MCPError as exc:
@@ -432,6 +535,7 @@ async def _review_task_core(
             from_statuses={"COMPLETED", "BLOCKED", "FAILED", "REVIEW_FAILED",
                            "REVIEW_INCOMPLETE", "CANCELLED"},
             to_status="REVIEWING",
+            owner_id=app.owner.owner_id,
         )
         if not claimed:
             current = await app.store.get_job(job_id)
@@ -445,17 +549,18 @@ async def _review_task_core(
             review_session_id=review_session_id,
             review_session_confirmed=0,
             review_error_json=None,
+            review_result_json=None,
         )
 
     try:
         r: ReviewResult = await app.scheduler.run(
-            lambda: app.runner.review(
+            lambda: _invoke(app, job_id, "review", review_session_id, lambda: app.runner.review(
                 original_task=original_task, acceptance=acceptance, cwd=str(resolved),
                 execution_summary=execution_summary, model=model,
                 timeout_sec=timeout, job_id=job_id,
                 session_id=review_session_id,
                 on_session_id=_session_confirmation_binding(app, job_id, "review"),
-            ),
+            )),
             label=f"review:{job_id}",
         )
     except asyncio.CancelledError:
@@ -468,7 +573,7 @@ async def _review_task_core(
         await app.store.set_review_session(
             job_id, review_session_id, "REVIEW_INCOMPLETE", None,
             review_status="INCOMPLETE", session_confirmed=confirmed,
-            error=exc.to_dict(),
+            error=_err(exc).model_dump(),
         )
         return ReviewTaskResult(
             job_id=job_id, status="FAILED", review_session_id=review_session_id,
@@ -485,7 +590,7 @@ async def _review_task_core(
         await app.store.set_review_session(
             job_id, review_session_id, "REVIEW_INCOMPLETE", None,
             review_status="INCOMPLETE", session_confirmed=confirmed,
-            error=err.to_dict(),
+            error=_err(err).model_dump(),
         )
         return ReviewTaskResult(
             job_id=job_id, status="FAILED", review_session_id=review_session_id,
@@ -521,7 +626,8 @@ async def _review_task_core(
     await app.store.set_review_session(
         job_id, review_session_id, job_status, r.summary,
         review_status=review_status, session_confirmed=r.session_confirmed,
-        error=r.error.to_dict() if r.error else None,
+        error=_err(r.error).model_dump() if r.error else None,
+        result=_review_to_result(job_id, r).model_dump(),
     )
     return _review_to_result(job_id, r)
 
@@ -600,6 +706,7 @@ async def _continue_task_core(
         from_statuses={"COMPLETED", "BLOCKED", "FAILED", "EXECUTION_INCOMPLETE",
                        "REVIEW_FAILED", "REVIEW_INCOMPLETE", "CANCELLED"},
         to_status="RESUMING_EXECUTION",
+        owner_id=app.owner.owner_id,
     )
     if not claimed:
         current = await app.store.get_job(job_id)
@@ -610,6 +717,7 @@ async def _continue_task_core(
     fields: dict[str, Any] = {
         "execution_status": "EXECUTING",
         "execution_error_json": None,
+        "execution_result_json": None,
     }
     if existing.get("review_status") or existing.get("review_session_id"):
         fields["review_status"] = "STALE"
@@ -617,12 +725,12 @@ async def _continue_task_core(
 
     try:
         r: ExecutionResult = await app.scheduler.run(
-            lambda: app.runner.continue_session(
+            lambda: _invoke(app, job_id, "continue", execution_session_id, lambda: app.runner.continue_session(
                 execution_session_id=execution_session_id, feedback=feedback,
                 cwd=str(resolved), model=model, effort=effort,
                 timeout_sec=timeout, job_id=job_id,
                 on_session_id=_session_confirmation_binding(app, job_id, "execution"),
-            ),
+            )),
             label=f"continue:{job_id}",
         )
     except asyncio.CancelledError:
@@ -635,7 +743,7 @@ async def _continue_task_core(
         await app.store.set_execution_session(
             job_id, execution_session_id, "EXECUTION_INCOMPLETE", None,
             execution_status="INCOMPLETE", session_confirmed=confirmed,
-            error=exc.to_dict(),
+            error=_err(exc).model_dump(),
         )
         return ContinueTaskResult(
             job_id=job_id, status="FAILED", execution_session_id=execution_session_id,
@@ -652,7 +760,7 @@ async def _continue_task_core(
         await app.store.set_execution_session(
             job_id, execution_session_id, "EXECUTION_INCOMPLETE", None,
             execution_status="INCOMPLETE", session_confirmed=confirmed,
-            error=err.to_dict(),
+            error=_err(err).model_dump(),
         )
         return ContinueTaskResult(
             job_id=job_id, status="FAILED", execution_session_id=execution_session_id,
@@ -669,7 +777,8 @@ async def _continue_task_core(
     await app.store.set_execution_session(
         job_id, execution_session_id, overall_status, r.summary,
         execution_status=stage_status, session_confirmed=r.session_confirmed,
-        error=r.error.to_dict() if r.error else None,
+        error=_err(r.error).model_dump() if r.error else None,
+        result=_exec_to_result(job_id, r).model_dump(),
     )
     return ContinueTaskResult(
         job_id=job_id,
@@ -681,6 +790,9 @@ async def _continue_task_core(
         files_changed=r.files_changed,
         validation=r.validation,
         error=_err(r.error) if r.error else None,
+        usage=r.usage,
+        output_truncated=r.output_truncated,
+        omitted=r.omitted,
     )
 
 
@@ -787,6 +899,7 @@ async def _get_job_status_core(app: AppState, job_id: str, cwd: str) -> JobStatu
         job_id = _require_text(job_id, "job_id")
     except MCPError as exc:
         return JobStatusResult(job_id=job_id, error=_err(exc))
+    await app.store.reconcile(app.owner.is_dead)
     job = await app.store.get_job(job_id)
     if job is None:
         return JobStatusResult(job_id=job_id, found=False)
@@ -802,6 +915,9 @@ async def _get_job_status_core(app: AppState, job_id: str, cwd: str) -> JobStatu
     return JobStatusResult(
         job_id=job_id,
         found=True,
+        usage=await app.store.get_usage(job_id),
+        execution_result=job.get("execution_result"),
+        review_result=job.get("review_result"),
         status=job.get("status"),
         execution_status=job.get("execution_status"),
         review_status=job.get("review_status"),
@@ -836,7 +952,21 @@ def _ping_metadata() -> PingResult:
 # --- FastMCP server & tool wrappers -----------------------------------------
 
 def build_server() -> FastMCP:
-    mcp = FastMCP("codex-claude-agent-mcp")
+    @asynccontextmanager
+    async def lifespan(server):
+        app = await get_app()
+        try:
+            yield app
+        finally:
+            # Shield graceful cleanup from transport/request cancel scopes.
+            import anyio
+            with anyio.CancelScope(shield=True):
+                await app.close()
+            global _app
+            if _app is app:
+                _app = None
+
+    mcp = FastMCP("codex-claude-agent-mcp", lifespan=lifespan)
 
     @mcp.tool()
     async def ping() -> PingResult:
@@ -852,12 +982,13 @@ def build_server() -> FastMCP:
         model: str | None = None,
         effort: Effort | None = None,
         timeout_sec: PositiveSeconds = 3600,
+        background: bool = False,
     ) -> ExecuteTaskResult:
         """Run one CC task without review; only a confirmed session is resumable."""
         app = await get_app()
         log.info("execute_tool job=%s rid=%s", job_id, _request_id())
         return await _execute_task_core(
-            app, job_id, task, cwd, acceptance, model, effort, timeout_sec, project_root,
+            app, job_id, task, cwd, acceptance, model, effort, timeout_sec, project_root, background,
         )
 
     @mcp.tool()
@@ -928,15 +1059,6 @@ def main() -> None:
     """Module entrypoint: ``python -m codex_claude_agent_mcp`` or the console script."""
     configure_logging()
     log.info("codex-claude-agent-mcp starting (pid=%s)", os.getpid())
-    # Initialize the app eagerly so DB init errors surface to stderr before the
-    # MCP loop begins, rather than mid-tool-call.
-    try:
-        asyncio.run(get_app())
-    except Exception:
-        log.exception("failed to initialize AppState before run")
-        # A configuration/store failure means the permission boundary or
-        # persistence contract is unavailable. Refuse to expose tools rather
-        # than starting a partially initialized server.
-        raise SystemExit(1)
+    # FastMCP lifespan initializes and closes AppState in the serving loop.
     mcp = build_server()
     mcp.run(transport="stdio")

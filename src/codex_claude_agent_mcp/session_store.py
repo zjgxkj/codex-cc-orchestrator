@@ -22,13 +22,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
 from typing import Any
 
-from .errors import MCPError, SESSION_MISMATCH, STATE_STORE_ERROR
+from .errors import CANCELLED, OWNER_LOST, MCPError, SESSION_MISMATCH, STATE_STORE_ERROR
 from .logging import get_logger
+from .usage import Usage, aggregate_usage
 
 log = get_logger("session_store")
 
@@ -53,6 +55,19 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at            REAL    NOT NULL,
     updated_at            REAL    NOT NULL
 );
+CREATE TABLE IF NOT EXISTS invocations (
+    invocation_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES jobs(job_id),
+    stage TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    owner_id TEXT,
+    started_at REAL NOT NULL,
+    finished_at REAL,
+    status TEXT NOT NULL,
+    usage_json TEXT
+);
+CREATE INDEX IF NOT EXISTS invocations_job ON invocations(job_id, started_at);
 """
 
 # Additive, backward-compatible migrations for databases created by an older
@@ -62,6 +77,9 @@ CREATE TABLE IF NOT EXISTS jobs (
 # Stage statuses separate completed verdicts from INCOMPLETE transport/protocol
 # outcomes and are recorded alongside the aggregate job status.
 _MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("owner_id", "ALTER TABLE jobs ADD COLUMN owner_id TEXT;"),
+    ("execution_result_json", "ALTER TABLE jobs ADD COLUMN execution_result_json TEXT;"),
+    ("review_result_json", "ALTER TABLE jobs ADD COLUMN review_result_json TEXT;"),
     ("project_root", "ALTER TABLE jobs ADD COLUMN project_root TEXT;"),
     ("execution_status", "ALTER TABLE jobs ADD COLUMN execution_status TEXT;"),
     ("review_status", "ALTER TABLE jobs ADD COLUMN review_status TEXT;"),
@@ -104,6 +122,22 @@ class SessionStore:
         self._lock = asyncio.Lock()
         self._conn: sqlite3.Connection | None = None
 
+    @staticmethod
+    async def _thread(func, *args):
+        task = asyncio.create_task(asyncio.to_thread(func, *args))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # Keep the sqlite connection locked until the outstanding operation
+            # finishes; cancellation cannot abandon a still-writing thread.
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+            task.result()
+            raise
+
     # -- lifecycle -----------------------------------------------------------
 
     async def init(self) -> None:
@@ -114,23 +148,47 @@ class SessionStore:
                 isolation_level=None,   # autocommit; we manage txns manually
                 check_same_thread=False,
             )
-            conn.execute("PRAGMA journal_mode=WAL;")
+            try:
+                conn.execute("PRAGMA journal_mode=WAL;")
+            except sqlite3.Error as exc:
+                conn.close()
+                raise
             conn.execute("PRAGMA synchronous=NORMAL;")
             conn.execute("PRAGMA busy_timeout=30000;")
             conn.execute("PRAGMA foreign_keys=ON;")
             conn.row_factory = sqlite3.Row  # name-keyed rows, immune to column order
             conn.executescript(_SCHEMA)
-            _apply_migrations(conn)
+            # Serialize PRAGMA inspection + ALTER across simultaneous upgrades.
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                _apply_migrations(conn)
+                conn.execute("COMMIT;")
+            except BaseException:
+                conn.execute("ROLLBACK;")
+                conn.close()
+                raise
             return conn
 
+        def open_with_retry():
+            # Windows can briefly retain a killed process's WAL mapping, making
+            # recovery truncation fail. Retry only this verified open-time
+            # failure with a fresh connection; never replay arbitrary writes.
+            for attempt in range(4):
+                try:
+                    return _open()
+                except sqlite3.OperationalError as exc:
+                    if os.name != "nt" or getattr(exc, "sqlite_errorname", "") != "SQLITE_IOERR_TRUNCATE" or attempt == 3:
+                        raise
+                    time.sleep(0.1 * (attempt + 1))
+
         async with self._lock:
-            self._conn = await asyncio.to_thread(_open)
+            self._conn = await self._thread(open_with_retry)
         log.info("session store ready: %s", self.db_path)
 
     async def close(self) -> None:
         async with self._lock:
             if self._conn is not None:
-                await asyncio.to_thread(self._conn.close)
+                await self._thread(self._conn.close)
                 self._conn = None
 
     @property
@@ -154,7 +212,7 @@ class SessionStore:
         # zip against a hardcoded tuple would truncate at the shortest side).
         d = dict(row)
         d["acceptance"] = json.loads(d.pop("acceptance_json"))
-        for field in ("execution_error_json", "review_error_json"):
+        for field in ("execution_error_json", "review_error_json", "execution_result_json", "review_result_json"):
             raw = d.pop(field, None)
             d[field.removesuffix("_json")] = json.loads(raw) if raw else None
         d["execution_session_confirmed"] = bool(d.get("execution_session_confirmed"))
@@ -175,6 +233,7 @@ class SessionStore:
         review_status: str | None = None,
         execution_session_id: str | None = None,
         review_session_id: str | None = None,
+        owner_id: str | None = None,
     ) -> dict[str, Any]:
         """Insert a new job. Raises MCPError(STATE_STORE_ERROR) on duplicate job_id.
 
@@ -203,6 +262,7 @@ class SessionStore:
                         execution_session_id, review_session_id, now, now,
                     ),
                 )
+                conn.execute("UPDATE jobs SET owner_id = ? WHERE job_id = ?", (owner_id, job_id))
                 conn.execute("COMMIT;")
             except sqlite3.IntegrityError as exc:
                 conn.execute("ROLLBACK;")
@@ -232,7 +292,7 @@ class SessionStore:
             }
 
         async with self._lock:
-            return await asyncio.to_thread(_do)
+            return await self._thread(_do)
 
     async def get_job(self, job_id: str) -> dict[str, Any] | None:
         def _do() -> dict[str, Any] | None:
@@ -240,7 +300,7 @@ class SessionStore:
             return self._row_to_dict(cur.fetchone())
 
         async with self._lock:
-            return await asyncio.to_thread(_do)
+            return await self._thread(_do)
 
     async def update_fields(self, job_id: str, **fields: Any) -> None:
         """Update arbitrary columns and bump updated_at.
@@ -257,6 +317,7 @@ class SessionStore:
             "execution_session_confirmed", "review_session_confirmed",
             "execution_summary", "review_summary",
             "execution_error_json", "review_error_json",
+            "execution_result_json", "review_result_json",
         }
         bad = set(fields) - allowed
         if bad:
@@ -282,7 +343,7 @@ class SessionStore:
                 raise MCPError(STATE_STORE_ERROR, f"update_fields failed: {exc}") from exc
 
         async with self._lock:
-            await asyncio.to_thread(_do)
+            await self._thread(_do)
 
     async def transition_status(
         self,
@@ -290,6 +351,7 @@ class SessionStore:
         *,
         from_statuses: set[str] | frozenset[str],
         to_status: str,
+        owner_id: str | None = None,
     ) -> bool:
         """Atomically claim a job state transition.
 
@@ -310,9 +372,9 @@ class SessionStore:
                 conn.execute("BEGIN IMMEDIATE;")
                 cur = conn.execute(
                     f"""UPDATE jobs
-                        SET status = ?, updated_at = ?
+                        SET status = ?, updated_at = ?, owner_id = COALESCE(?, owner_id)
                         WHERE job_id = ? AND status IN ({placeholders});""",
-                    (to_status, now, job_id, *expected),
+                    (to_status, now, owner_id, job_id, *expected),
                 )
                 conn.execute("COMMIT;")
                 return cur.rowcount == 1
@@ -324,7 +386,7 @@ class SessionStore:
                 raise MCPError(STATE_STORE_ERROR, f"transition_status failed: {exc}") from exc
 
         async with self._lock:
-            return await asyncio.to_thread(_do)
+            return await self._thread(_do)
 
     async def list_jobs(self) -> list[dict[str, Any]]:
         def _do() -> list[dict[str, Any]]:
@@ -332,9 +394,102 @@ class SessionStore:
             return [r for r in (self._row_to_dict(row) for row in cur.fetchall()) if r]
 
         async with self._lock:
-            return await asyncio.to_thread(_do)
+            return await self._thread(_do)
 
     # -- convenience ---------------------------------------------------------
+
+    async def mark_cancelled(self, job_id: str, expected_status: str, stage: str, owner_id: str) -> None:
+        """One CAS transaction: do not expose INCOMPLETE before its evidence.
+
+        Otherwise another process could resume between the status update and
+        error update, and receive stale cancellation data from the old worker.
+        """
+        if stage not in {"execution", "review"}:
+            raise MCPError(STATE_STORE_ERROR, "invalid cancellation stage")
+        def cancel():
+            conn = self.conn
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                row = conn.execute("SELECT * FROM jobs WHERE job_id=? AND status=? AND owner_id=?",
+                                   (job_id, expected_status, owner_id)).fetchone()
+                if row:
+                    error = json.dumps({"code": CANCELLED, "message": f"{stage} request was cancelled",
+                        "retryable": False, "details": {"stage": stage,
+                        "session_id": row[f"{stage}_session_id"],
+                        "session_confirmed": bool(row[f"{stage}_session_confirmed"])}})
+                    conn.execute(f"UPDATE jobs SET status=?, {stage}_status='INCOMPLETE', "
+                        f"{stage}_error_json=?, {stage}_result_json=NULL, updated_at=? WHERE job_id=?",
+                        (stage.upper() + "_INCOMPLETE", error, self._now(), job_id))
+                conn.execute("COMMIT;")
+            except BaseException:
+                conn.execute("ROLLBACK;")
+                raise
+        async with self._lock:
+            await self._thread(cancel)
+
+    async def start_invocation(self, invocation_id: str, job_id: str, stage: str,
+                               operation: str, session_id: str, owner_id: str) -> None:
+        async with self._lock:
+            await self._thread(self.conn.execute,
+                "INSERT INTO invocations VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'RUNNING', NULL)",
+                (invocation_id, job_id, stage, operation, session_id, owner_id, self._now()))
+
+    async def finish_invocation(self, invocation_id: str, status: str, usage: Usage | None) -> None:
+        async with self._lock:
+            await self._thread(self.conn.execute,
+                "UPDATE invocations SET finished_at=?, status=?, usage_json=? "
+                "WHERE invocation_id=? AND status='RUNNING'",
+                (self._now(), status, usage.model_dump_json() if usage else None, invocation_id))
+
+    async def get_invocations(self, job_id: str) -> list[dict]:
+        def read():
+            rows = self.conn.execute(
+                "SELECT * FROM invocations WHERE job_id=? ORDER BY started_at, invocation_id", (job_id,))
+            result = []
+            for row in rows:
+                item = dict(row)
+                raw = item.pop("usage_json")
+                item["usage"] = json.loads(raw) if raw else None
+                result.append(item)
+            return result
+        async with self._lock:
+            return await self._thread(read)
+
+    async def get_usage(self, job_id: str):
+        return aggregate_usage(await self.get_invocations(job_id))
+
+    async def reconcile(self, is_dead, *, owner_id: str | None = None) -> None:
+        """Atomically interrupt only owners proven gone (or our shutdown owner).
+
+        Legacy NULL owners cannot be proven dead: leave them untouched rather
+        than corrupting work in an older, simultaneously running MCP server.
+        """
+        def recover():
+            conn = self.conn
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                rows = conn.execute("SELECT job_id, status, owner_id FROM jobs WHERE status IN "
+                    "('QUEUED','EXECUTING','RESUMING_EXECUTION','REVIEWING')").fetchall()
+                now = self._now()
+                for row in rows:
+                    owner = row["owner_id"]
+                    if not owner or not (owner == owner_id or is_dead(owner)):
+                        continue
+                    stage = "review" if row["status"] == "REVIEWING" else "execution"
+                    error = json.dumps({"code": CANCELLED if owner == owner_id else OWNER_LOST,
+                        "message": "MCP execution owner stopped; task did not complete",
+                        "retryable": False, "details": {"stage": stage}})
+                    conn.execute(f"UPDATE jobs SET status=?, {stage}_status='INCOMPLETE', "
+                        f"{stage}_error_json=?, {stage}_result_json=NULL, updated_at=? WHERE job_id=?",
+                        (stage.upper() + "_INCOMPLETE", error, now, row["job_id"]))
+                    conn.execute("UPDATE invocations SET status='INCOMPLETE', finished_at=? "
+                        "WHERE job_id=? AND owner_id=? AND status='RUNNING'", (now, row["job_id"], owner))
+                conn.execute("COMMIT;")
+            except BaseException:
+                conn.execute("ROLLBACK;")
+                raise
+        async with self._lock:
+            await self._thread(recover)
 
     async def confirm_session(self, job_id: str, kind: str, session_id: str) -> None:
         """Confirm that the stream echoed this job's preallocated session id."""
@@ -371,12 +526,13 @@ class SessionStore:
                 raise MCPError(STATE_STORE_ERROR, f"confirm_session failed: {exc}") from exc
 
         async with self._lock:
-            await asyncio.to_thread(_do)
+            await self._thread(_do)
 
     async def set_execution_session(
         self, job_id: str, session_id: str | None, status: str,
         summary: str | None, *, execution_status: str | None = None,
         session_confirmed: bool | None = None, error: dict[str, Any] | None = None,
+        result: dict[str, Any] | None = None,
     ) -> None:
         """Persist the execution stage outcome: session id, stage and job status, summary."""
         fields: dict[str, Any] = {
@@ -384,6 +540,7 @@ class SessionStore:
             "execution_status": execution_status or status,
             "execution_summary": summary,
             "execution_error_json": json.dumps(error) if error else None,
+            "execution_result_json": json.dumps(result) if result else None,
         }
         if session_id:
             fields["execution_session_id"] = session_id
@@ -395,6 +552,7 @@ class SessionStore:
         self, job_id: str, session_id: str | None, status: str, summary: str | None,
         review_status: str | None = None, *, session_confirmed: bool | None = None,
         error: dict[str, Any] | None = None,
+        result: dict[str, Any] | None = None,
     ) -> None:
         """Persist the review stage outcome.
 
@@ -406,6 +564,7 @@ class SessionStore:
             "review_status": review_status,
             "review_summary": summary,
             "review_error_json": json.dumps(error) if error else None,
+            "review_result_json": json.dumps(result) if result else None,
         }
         if session_id:
             fields["review_session_id"] = session_id

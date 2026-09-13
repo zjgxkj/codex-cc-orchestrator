@@ -160,7 +160,7 @@ def test_prompts_encode_validation_review_permissions_and_compact_finish(tmp_pat
     assert sum(map(len, (
         _EXEC_SYSTEM_APPEND, _REVIEW_SYSTEM_APPEND, _CONTINUE_PROMPT_TEMPLATE,
         _TASK_PROMPT_TEMPLATE, _REVIEW_PROMPT_TEMPLATE,
-    ))) < 2_400
+    ))) < 3_000  # v0.4 adds failure-first compact-output instructions.
 
 
 async def test_mcp_tool_descriptions_stay_compact() -> None:

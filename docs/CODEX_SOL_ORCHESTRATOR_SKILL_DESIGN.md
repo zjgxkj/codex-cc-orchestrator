@@ -29,6 +29,11 @@ Codex 不为派单先通读仓库、找完根因或设计完整实现。它只�
 
 ## MCP 约束
 
+短且 ready 的任务包用 `run_job`；未知范围、长实现和大型测试优先
+`execute_task(background=true)`，提交一次后间隔查询 `get_job_status`，期间做无依赖工作。
+排队/执行中不是成功；完成后才决定 fresh Review。中断仍按 session 确认状态恢复，
+不因后台模式放宽接手修复或权限边界。
+
 `execute_task` 不自动 Review；`run_job(review=true)` 执行后开全新 Review；普通返修用 `continue_task` 恢复 CC-1。相同 `job_id` 必须保持 task/acceptance/cwd/`project_root` 不变，变更目标或项目根就换 ID。派单时必须显式传 `project_root`：来自 Codex 自身 workspace 上下文（或该 job 明确选定的项目根），绝不能是 MCP 进程 cwd、猜测路径或整盘根；它只授权该 job，`continue_task` 无此入参并继承已存值。超时后先查真实状态，不能盲目重做。MCP 仍保留 cwd、session、结构化输出和权限边界；Reviewer 无 Bash/写权限，图片附件不会从 Codex 会话自动转发。
 
 Skill 可自动匹配，也可显式写 `$codex-sol-claude-orchestrator`；自动选择不是强制钩子。源文件与 `~/.codex/skills/codex-sol-claude-orchestrator` 应保持一致，其他客户端项目和 Skill 不参与本流程。

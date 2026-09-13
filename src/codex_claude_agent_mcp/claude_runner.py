@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from .compact import EXEC_OUTPUT_FORMAT, REVIEW_OUTPUT_FORMAT, OUTPUT_BUDGET_APPEND
+from .usage import Usage, extract_usage
 from .config import DEFAULT_MAX_BUFFER_SIZE
 from .errors import (
     CLAUDE_AUTH_ERROR,
@@ -103,35 +105,10 @@ _TASK_PROMPT_TEMPLATE = "TASK:\n{task}\n\nACCEPTANCE:\n{acceptance}\n\nCWD: {cwd
 
 _REVIEW_PROMPT_TEMPLATE = "TASK:\n{task}\n\nACCEPTANCE:\n{acceptance}\n\n{execution_line}Verify each criterion against current state.\n"
 
-_EXEC_OUTPUT_FORMAT = {
-    "type": "json_schema",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "status": {"type": "string", "enum": ["COMPLETED", "BLOCKED", "FAILED"]},
-            "summary": {"type": "string"},
-            "files_changed": {"type": "array", "items": {"type": "string"}},
-            "validation": {"type": "array", "items": {"type": "string"}},
-        },
-        "required": ["status", "summary", "files_changed", "validation"],
-        "additionalProperties": False,
-    },
-}
-
-_REVIEW_OUTPUT_FORMAT = {
-    "type": "json_schema",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "verdict": {"type": "string", "enum": ["PASS", "FAIL"]},
-            "summary": {"type": "string"},
-            "unmet_criteria": {"type": "array", "items": {"type": "string"}},
-            "evidence": {"type": "array", "items": {"type": "string"}},
-        },
-        "required": ["verdict", "summary", "unmet_criteria", "evidence"],
-        "additionalProperties": False,
-    },
-}
+_EXEC_SYSTEM_APPEND += OUTPUT_BUDGET_APPEND
+_REVIEW_SYSTEM_APPEND += OUTPUT_BUDGET_APPEND
+_EXEC_OUTPUT_FORMAT = EXEC_OUTPUT_FORMAT
+_REVIEW_OUTPUT_FORMAT = REVIEW_OUTPUT_FORMAT
 
 
 # --- Result dataclasses -----------------------------------------------------
@@ -146,7 +123,9 @@ class ExecutionResult:
     files_changed: list[str] = field(default_factory=list)
     validation: list[str] = field(default_factory=list)
     error: MCPError | None = None
-    cost_usd: float | None = None
+    usage: Usage | None = None
+    output_truncated: bool = False
+    omitted: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -159,7 +138,9 @@ class ReviewResult:
     unmet_criteria: list[str] = field(default_factory=list)
     evidence: list[str] = field(default_factory=list)
     error: MCPError | None = None
-    cost_usd: float | None = None
+    usage: Usage | None = None
+    output_truncated: bool = False
+    omitted: dict[str, int] = field(default_factory=dict)
 
 
 # --- JSON extraction --------------------------------------------------------
@@ -731,7 +712,7 @@ class RealClaudeRunner(ClaudeRunner):
 
         session_id = stream_session or expected_session_id or (getattr(result_msg, "session_id", None) if result_msg else None)
         session_confirmed = stream_session is not None
-        cost = getattr(result_msg, "total_cost_usd", None) if result_msg else None
+        usage = extract_usage(result_msg) if result_msg is not None else None
 
         diagnostic = "\n".join(part for part in (text, stream_error or "") if part)
         classified = self._classify_error(
@@ -744,7 +725,7 @@ class RealClaudeRunner(ClaudeRunner):
         if classified is not None:
             return ExecutionResult(
                 status="FAILED", session_id=session_id,
-                session_confirmed=session_confirmed, error=classified, cost_usd=cost,
+                session_confirmed=session_confirmed, error=classified, usage=usage,
             )
 
         if result_msg is None:
@@ -771,7 +752,7 @@ class RealClaudeRunner(ClaudeRunner):
             )
             return ExecutionResult(
                 status="FAILED", session_id=session_id,
-                session_confirmed=session_confirmed, error=err, cost_usd=cost,
+                session_confirmed=session_confirmed, error=err, usage=usage,
             )
 
         structured = getattr(result_msg, "structured_output", None) if result_msg else None
@@ -783,10 +764,10 @@ class RealClaudeRunner(ClaudeRunner):
                 status="FAILED",
                 session_id=session_id,
                 session_confirmed=session_confirmed,
-                summary=getattr(result_msg, "result", None) or text[:500],
+                summary="Worker output was not a valid structured result.",
                 # Deterministic: the same output will fail to parse again.
                 error=MCPError(CLAUDE_PROTOCOL_ERROR, "could not parse structured status from claude output"),
-                cost_usd=cost,
+                usage=usage,
             )
 
         status = obj.get("status")
@@ -807,7 +788,7 @@ class RealClaudeRunner(ClaudeRunner):
                 session_id=session_id,
                 session_confirmed=session_confirmed,
                 error=MCPError(CLAUDE_PROTOCOL_ERROR, "claude returned an invalid execution result"),
-                cost_usd=cost,
+                usage=usage,
             )
         return ExecutionResult(
             status=status,
@@ -817,7 +798,7 @@ class RealClaudeRunner(ClaudeRunner):
             summary=summary,
             files_changed=files_changed,
             validation=validation,
-            cost_usd=cost,
+            usage=usage,
         )
 
     async def review(
@@ -859,7 +840,7 @@ class RealClaudeRunner(ClaudeRunner):
 
         session_id = stream_session or session_id or (getattr(result_msg, "session_id", None) if result_msg else None)
         session_confirmed = stream_session is not None
-        cost = getattr(result_msg, "total_cost_usd", None) if result_msg else None
+        usage = extract_usage(result_msg) if result_msg is not None else None
 
         diagnostic = "\n".join(part for part in (text, stream_error or "") if part)
         classified = self._classify_error(
@@ -872,7 +853,7 @@ class RealClaudeRunner(ClaudeRunner):
         if classified is not None:
             return ReviewResult(
                 status="FAILED", session_id=session_id,
-                session_confirmed=session_confirmed, error=classified, cost_usd=cost,
+                session_confirmed=session_confirmed, error=classified, usage=usage,
             )
 
         if result_msg is None:
@@ -899,7 +880,7 @@ class RealClaudeRunner(ClaudeRunner):
             )
             return ReviewResult(
                 status="FAILED", session_id=session_id,
-                session_confirmed=session_confirmed, error=err, cost_usd=cost,
+                session_confirmed=session_confirmed, error=err, usage=usage,
             )
 
         structured = getattr(result_msg, "structured_output", None) if result_msg else None
@@ -911,10 +892,10 @@ class RealClaudeRunner(ClaudeRunner):
                 status="FAILED",
                 session_id=session_id,
                 session_confirmed=session_confirmed,
-                summary=getattr(result_msg, "result", None) or text[:500],
+                summary="Worker output was not a valid structured result.",
                 # Deterministic: the same output will fail to parse again.
                 error=MCPError(CLAUDE_PROTOCOL_ERROR, "could not parse structured verdict from claude output"),
-                cost_usd=cost,
+                usage=usage,
             )
 
         verdict = obj.get("verdict")
@@ -935,7 +916,7 @@ class RealClaudeRunner(ClaudeRunner):
                 session_id=session_id,
                 session_confirmed=session_confirmed,
                 error=MCPError(CLAUDE_PROTOCOL_ERROR, "claude returned an invalid review result"),
-                cost_usd=cost,
+                usage=usage,
             )
         # Contradictory payloads violate the review contract (PASS means no
         # unmet criteria; FAIL must name them) and are deterministic.
@@ -952,7 +933,7 @@ class RealClaudeRunner(ClaudeRunner):
                     CLAUDE_PROTOCOL_ERROR,
                     f"claude review verdict contradicts its criteria list ({verdict})",
                 ),
-                cost_usd=cost,
+                usage=usage,
             )
         return ReviewResult(
             status=verdict,
@@ -962,7 +943,7 @@ class RealClaudeRunner(ClaudeRunner):
             summary=summary,
             unmet_criteria=unmet_criteria,
             evidence=evidence,
-            cost_usd=cost,
+            usage=usage,
         )
 
 

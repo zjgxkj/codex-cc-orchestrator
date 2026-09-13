@@ -2,7 +2,7 @@
 
 > 文档类型：Architecture + Implementation Specification  
 > 受众：Codex / 实现工程师  
-> 状态：v0.3 Current Implementation
+> 状态：v0.4 Current Implementation；新增接口与生命周期以 [v0.4 定稿](V0.4.md) 为准
 > 通信模式：STDIO MCP  
 > 日期：2026-08-12
 
@@ -450,7 +450,7 @@ Read / Search / Edit / Bash
 - final result
 - session_id
 - success / blocked / failed
-- usage/cost（若 SDK 暴露且方便）
+- invocation usage/cache/turns/duration（原始报告值；缺失为 null，不统计价格）
 - error
 
 ### 10.3 Claude Code system prompt preset
@@ -517,6 +517,10 @@ FAIL 时列出：
 ## 11. MCP Tool API
 
 ### 11.1 execute_task
+
+v0.4 增加可选 `background=false`；`true` 返回 QUEUED 与未确认的预分配 session，
+再通过 `get_job_status` 取结果。下例为默认同步模式；新增 Usage/裁剪元数据见
+[v0.4 定稿](V0.4.md)，现有字段保留。
 
 ```json
 {
