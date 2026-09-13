@@ -1,4 +1,4 @@
-# Claude-Agent MCP Implementation Spec — STDIO Edition
+# 点将台：Claude-Agent MCP 实现规范（STDIO）
 
 > 文档类型：Architecture + Implementation Specification  
 > 受众：Codex / 实现工程师  

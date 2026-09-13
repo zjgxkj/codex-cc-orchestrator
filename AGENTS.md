@@ -2,7 +2,7 @@
 
 ## Project purpose
 
-This repository implements a local **STDIO MCP server** that allows Codex to
+This repository, **点将台**, implements a local **STDIO MCP server** that allows Codex to
 delegate already-scoped coding tasks to Claude Code through the Claude Agent SDK.
 
 Read `docs/CODEX_CLAUDE_AGENT_MCP_SPEC.md`

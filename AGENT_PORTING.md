@@ -1,7 +1,23 @@
-# 迁移到其他 Agent 组合
+# 点将台：迁移到其他 Agent 组合
 
 本项目当前组合是 **Codex（编排者）→ MCP → Claude Code（执行者/Reviewer）**。
 如果使用其他 Agent，不要只替换名称；先判断需要迁移哪一层。
+
+## 通用角色模型
+
+```text
+主脑 / Commander Agent
+  ├─ 做需求、架构、边界和最终验收
+  └─ 产生 task + scope + acceptance + cwd
+                 │
+                 ▼
+      点将台 MCP（确定性控制层）
+        ├─ Worker：调查、实现、验证
+        └─ Reviewer：全新只读会话、独立审查
+```
+
+Worker 和 Reviewer 可以使用同一 Agent 的不同会话，也可以使用两个不同 Agent；
+必须分别配置能力与权限，不能把“换了模型”当成“独立会话”的替代。
 
 ## 三种情况
 
@@ -49,22 +65,47 @@
 ## 可直接交给目标 Agent 的迁移指令
 
 ```text
-把当前项目从“Codex → Claude Code”迁移为“{编排 Agent} → {执行 Agent}”。
+目标：把“点将台”从 Codex → Claude Code 迁移为：
+- 主脑/编排端：{COMMANDER_AGENT}
+- 执行端：{WORKER_AGENT}
+- Reviewer：{REVIEWER_AGENT；默认 WORKER_AGENT 的全新只读会话}
+- 原项目：{SOURCE_DIR}
+- 新项目：{TARGET_DIR}
 
-先判断只需更换编排端、执行端，还是两端都更换。不要机械替换名称。
-优先保持现有 MCP Tool schema、job/session/cwd/project_root 绑定、临时目录授权、
-只读独立 Review、INCOMPLETE 状态、SQLite 原子状态和 STDIO 纪律。
+在修改前先完成能力审计，并用简短表格报告：
+1. 编排端是否支持本地 STDIO MCP、结构化 Tool Result 和规则文件/Skill；
+2. 执行端是否支持指定 cwd、启动并返回稳定 session、恢复原 session、工具权限控制、
+   结构化输出、超时和取消；
+3. Reviewer 是否能保证全新会话和只读工具；
+4. 本次属于“只换编排端”“只换执行端”还是“两端都换”。
 
-若更换执行端，请用其官方 SDK/CLI 实现 Runner 适配层，并验证启动 session、恢复执行
-session、新建 Review session、工具权限、结构化输出、超时取消和错误分类。缺失能力必须
-明确报告并设计最小降级，禁止伪造成功。
+发现能力缺口时不要猜接口、伪造 session、伪造 Review 或降低目录安全。先查目标 Agent
+的实际 SDK/CLI；仍缺失时列出最小降级及其影响，只把真正需要用户决定的事项上报。
 
-若更换编排端，请提供该客户端的 STDIO MCP 安装配置，并把编排 Skill 改成它实际支持的
-规则格式。MCP 不负责智能拆解；编排者保留决策和最终验收，执行者接收明确 task、scope、
-acceptance 和 cwd。
+实施要求：
+- 在 TARGET_DIR 创建独立迁移项目，不覆盖 SOURCE_DIR，不修改 ZCode 或其他同类项目；
+- 不做全仓机械改名。先保持 MCP Tool schema 和工作流核心，再把平台差异隔离到 Runner、
+  客户端配置、提示词/工具权限、鉴权、模型配置与错误映射；
+- MCP 只做确定性调度和校验，不拆任务、不选择模型、不创造 acceptance；
+- 永久保留 job/task/acceptance/cwd/project_root/session 绑定、Job 临时授权、continue 不扩权、
+  fresh read-only review、confirmed session 才可恢复、INCOMPLETE 语义、SQLite 原子状态、
+  有界并发以及 stdout 仅承载 MCP 协议；
+- 编排规则保持轻量：主脑保留未决产品/架构/安全决策与最终验收；范围明确且可独立验证的
+  实现、排错、重构、测试、算法、迁移和数据/建模工作优先派发；只有真实决策点才回传；
+- 执行者负责必要验证；Reviewer 独立审查代码、逻辑和证据，不默认重复全部测试；
+- 不写入密钥、账号、真实模型中转地址或本机私有绝对路径。
 
-在独立目录完成迁移，不修改原项目；同步文档和测试，跑完整回归与一次真实链路。最后报告
-架构差异、降级项、安装方法、测试结果和是否需要重启客户端。
+验证要求：
+1. 先让 Fake Runner 的现有回归全部通过，再增加目标 SDK/CLI 的适配测试；
+2. 覆盖启动/确认/resume session、fresh review、只读限制、cwd/project_root 越权、job 串线、
+   超时取消、协议错误、并发与多进程状态；
+3. 在临时项目跑一次真实 execute → get_job_status → continue → review 链路；
+4. 同步 README、安装说明、环境变量、包名和新的编排 Skill；执行隐私扫描；
+5. 若目标端没有某项能力，测试必须证明降级会明确报错，而不是静默成功。
+
+工作方式：优先自行检查仓库和目标工具，不把大段源码复制回主会话；保持改动最小、可审查、
+可回滚。完成后只报告：迁移类型、架构差异、能力降级、安装方法、测试/实测结果、隐私扫描、
+是否需要重启，以及仍需用户决定的事项。
 ```
 
 ## 许可

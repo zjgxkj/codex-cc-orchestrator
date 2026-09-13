@@ -1,8 +1,18 @@
 [project]
 name = "codex-claude-agent-mcp"
 version = "0.3.0"
-description = "STDIO MCP server that lets Codex delegate scoped coding tasks to Claude Code via the Claude Agent SDK."
+description = "点将台：Codex 将明确任务委派给 Claude Code 执行与独立审查的 STDIO MCP 多智能体编排器。"
 readme = "README.md"
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "codex",
+    "claude-code",
+    "multi-agent",
+    "agent-orchestration",
+    "task-delegation",
+    "code-review",
+]
 license = "LicenseRef-NonCommercial-Reciprocal-Source-1.0"
 license-files = ["LICENSE"]
 authors = [

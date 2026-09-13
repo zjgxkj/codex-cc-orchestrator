@@ -1,74 +1,88 @@
-# codex-claude-agent-mcp
+# 点将台
 
-A local **STDIO MCP server** that lets **Codex** delegate already-scoped
-coding tasks to **Claude Code** through the **Claude Agent SDK**.
+### Codex × Claude Code 多智能体编排器
 
-Codex is the intelligent orchestrator: it decomposes large tasks, keeps the
-high-judgment decisions, and emits a concrete `task` + `acceptance` package for
-each delegated job. This MCP server is a **thin, deterministic job runner and
-session manager** — it does not plan, does not split tasks, and does not invent
-acceptance criteria.
+让 Codex 做主脑，让 Claude Code 做执行单元。<br>
+自动判断任务、派发执行、独立审查，最后由 Codex 验收。
+
+点将台是一套本地 **STDIO MCP + 编排 Skill**：上游 Agent 负责产品、架构和高难
+决策，把范围明确的实现、排错、重构、测试、算法、迁移及数据/模型工作交给执行
+Agent；独立 Reviewer 检查实质变更，最后由上游 Agent 验收用户目标。
+
+当前实现是 **Codex → Claude Code**。它同时也是可迁移的“主脑 Agent → MCP →
+执行 Agent / Reviewer”模板；更换编排端或执行端时，按
+[AGENT_PORTING.md](AGENT_PORTING.md) 先审计目标能力，再替换对应适配层。
+
+> 任务判断由编排 Skill 或上游 Agent 完成。MCP 保持轻量和确定性，只负责调度、
+> 权限、会话、按要求启动 Review，以及返回结构化结果。
+
+## 功能与用途
+
+- **能力分工**：高判断任务留给主脑，明确且可验证的工作包交给执行 Agent。
+- **工程执行**：覆盖功能实现、Bug 根因排查、重构、测试、算法、迁移和建模工作。
+- **连续会话**：保存并确认 execution session，可带反馈恢复原执行上下文。
+- **独立审查**：Reviewer 使用全新只读会话，不修改代码、不混入执行会话。
+- **批量编排**：支持独立 Job 的有界并发和确定性 execute → review 流程。
+- **临时授权**：项目权限绑定单个 Job；续跑和审查不能切换或扩大目录。
+- **可靠恢复**：SQLite 保存状态；超时或结果丢失后可查询并安全决定续跑。
+- **可迁移架构**：保留工作流核心，按目标 Agent 能力更换客户端规则或 Runner。
 
 ```
-Codex  (MCP client)
-      │  stdin / stdout  (STDIO MCP)
+Codex（主脑 / MCP Client）
+      │  stdin / stdout（STDIO MCP）
       ▼
-codex-claude-agent-mcp  (local subprocess)
-      ├── Claude execution session  (reads/edits/runs tools)
-      └── Claude review session     (fresh, read-only, PASS/FAIL)
+点将台 MCP（本地子进程）
+      ├── Claude 执行会话（读取、修改、运行验证）
+      └── Claude 审查会话（全新、只读、PASS/FAIL）
 ```
 
-## Tools
+## MCP 工具
 
-| Tool           | Purpose                                                                |
-| -------------- | --------------------------------------------------------------------- |
-| `execute_task` | Run a scoped task via Claude Code; returns `session_id`. Never reviews.|
-| `review_task`  | Fresh read-only Claude session judges PASS/FAIL. Needs `acceptance`.   |
-| `continue_task`| Resume an execution session with reviewer/orchestrator feedback.       |
-| `run_job`      | Execute, then optionally review, as one deterministic flow.           |
-| `run_jobs`     | Batch of independently-scoped jobs with bounded concurrency.          |
-| `get_job_status` | Read persisted job state (sessions, stage statuses); post-timeout recovery. |
-| `ping`         | Liveness check (pid, server/SDK version, effective CLI path/version, buffer size); never touches Claude. |
+| 工具 | 用途 |
+| --- | --- |
+| `execute_task` | 让执行 Agent 完成明确任务并返回 execution session；不自动 Review。 |
+| `review_task` | 用全新只读会话按 acceptance 独立判定 PASS/FAIL。 |
+| `continue_task` | 把反馈送回原 execution session 继续修复。 |
+| `run_job` | 按要求执行 execute → 可选 review。 |
+| `run_jobs` | 有界并发运行多个互相独立的 Job。 |
+| `get_job_status` | 查询持久化状态，用于超时或结果丢失后的恢复。 |
+| `ping` | 检查 Server、SDK、CLI 与缓冲配置；不调用执行 Agent。 |
 
-Fresh execution/review sessions receive a server-generated UUID before launch.
-The stream must echo it before it is marked resumable. Stage state, session
-confirmation, and structured errors are persisted; `get_job_status(job_id,
-cwd)` safely recovers them after a timeout or lost response.
+Server 在启动执行或审查前分配 UUID，只有执行端回报相同 session 后才允许续跑。
+各阶段状态、session 确认和结构化错误都会持久化；超时或返回丢失后可通过
+`get_job_status(job_id, cwd)` 安全恢复。
 
-### Job-scoped project authorization
+### 任务级项目授权
 
-`execute_task`, `review_task`, `run_job`, and each `run_jobs` `JobSpec` accept an
-optional `project_root`. Codex passes the trusted active workspace root
-explicitly — it is **never** inferred from the MCP process cwd.
+`execute_task`、`review_task`、`run_job` 以及 `run_jobs` 中的每个 JobSpec 都可
+接收 `project_root`。Codex 必须显式传入可信的活动 workspace root，MCP **不会**
+根据自身进程 cwd 猜测。
 
-- Supplied → it must be an existing absolute directory, `cwd` must be that root
-  or a child of it, and it is accepted even outside `ALLOWED_PROJECT_ROOTS`.
-  The resolved root is persisted with the job.
-- Omitted → the legacy `ALLOWED_PROJECT_ROOTS` check applies unchanged.
-- `continue_task` has no `project_root` input: it inherits the stored root (and
-  always requires the persisted `cwd` and execution session).
-- `review_task` on an existing job inherits the stored root; a supplied
-  `project_root` must match it exactly. It can never add, switch, or widen a
-  root. A review-only new job may establish one.
+- 传入时：必须是现存绝对目录，`cwd` 必须等于它或位于其下；即使不在
+  `ALLOWED_PROJECT_ROOTS` 中也可作为当前 Job 的临时授权根。
+- 省略时：继续按 `ALLOWED_PROJECT_ROOTS` 长期可信目录校验。
+- `continue_task` 没有 `project_root` 参数，只能继承已保存的根、`cwd` 和 session。
+- 已存在 Job 的 `review_task` 只能继承或精确匹配原根，不能新增、切换或扩大授权。
 
-### Deterministic rules (spec §6, §11)
+### 确定性规则（规范 §6、§11）
 
-- `review=false` → execute only.
-- `review=true` + non-empty `acceptance` → execute → fresh review → combined result.
-- `review=true` + **empty** `acceptance` → `REVIEW_REQUIRES_ACCEPTANCE` error (before any Claude call).
-- The MCP **never** generates acceptance criteria, never splits tasks, and never
-  decides on its own whether to review.
-- Execution owns proportionate validation and unclear-Bug reproduction/retest;
-  existing failing tests or clear error evidence already count as reproduction.
-- Fresh review is Read/Grep/Glob-only and checks code/logic plus the reported
-  evidence; when evidence is insufficient it names the targeted check CC-1 needs.
+- `review=false`：只执行，不审查。
+- `review=true` 且 acceptance 非空：execute → 全新 review → 合并结果。
+- `review=true` 但 acceptance 为空：在调用 CC 前返回
+  `REVIEW_REQUIRES_ACCEPTANCE`。
+- MCP 不生成验收标准、不拆任务，也不自行决定是否 Review。
+- 执行者负责与风险相称的验证；Bug 触发或根因不清时先复现并按同一条件复验，
+  已有可靠失败测试或明确错误证据时不强制造复现。
+- Reviewer 仅使用 Read/Grep/Glob，检查代码、逻辑和执行证据；证据不足时指出执行者
+  需要补充的针对性验证。
 
-## Install
+## 快速安装
 
-Requires Python 3.13+ and [uv](https://docs.astral.sh/uv/).
+需要 Python 3.13+ 和 [uv](https://docs.astral.sh/uv/)。完整中文步骤见
+[INSTALL.md](INSTALL.md)。
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/zjgxkj/codex-claude-agent-mcp.git
 cd codex-claude-agent-mcp
 uv sync
 ```
@@ -222,18 +236,12 @@ Copy that directory to `~/.codex/skills/` if you want Codex to apply the
 delegation workflow automatically. It is intentionally separate from MCP
 server installation.
 
-### Other MCP clients
+### 其他 MCP Client
 
-The server is not tied to the Codex executable: another agent can use it if its
-client supports local STDIO MCP and structured tool results. That client must
-provide a trusted `project_root` for each new job (or rely on explicitly
-configured `ALLOWED_PROJECT_ROOTS`) and must orchestrate task/review/resume
-calls itself. The bundled orchestration Skill is Codex-specific and is optional.
-
-For adapting the server or orchestration rules to a different coordinator/worker
-pair, see [AGENT_PORTING.md](AGENT_PORTING.md). It includes a capability checklist,
-preserved invariants, migration steps, and a prompt that can be given directly to
-the target agent.
+Server 本身不绑定 Codex 可执行程序。其他 Agent 只要支持本地 STDIO MCP 和结构化
+Tool Result，也可以使用；客户端必须为新 Job 提供可信 `project_root`，并负责安排
+task、review 和 resume。更换主脑或执行端时见
+[AGENT_PORTING.md](AGENT_PORTING.md)。
 
 ## Status: v0.3 hardened
 

@@ -1,4 +1,4 @@
-# Codex 部署说明（Claude-Agent MCP STDIO）
+# 点将台安装说明（Codex × Claude Code）
 
 > 目标：把本项目作为 STDIO MCP Server 接入 Codex，让 Codex 把已拆好的任务委派给 Claude Code 执行与验收。
 >
@@ -33,7 +33,7 @@
 
 ```bash
 # 如果你还没拿到代码
-git clone <repo-url> codex-claude-agent-mcp
+git clone https://github.com/zjgxkj/codex-claude-agent-mcp.git codex-claude-agent-mcp
 cd codex-claude-agent-mcp
 
 # 创建虚拟环境并安装依赖（mcp + claude-agent-sdk）

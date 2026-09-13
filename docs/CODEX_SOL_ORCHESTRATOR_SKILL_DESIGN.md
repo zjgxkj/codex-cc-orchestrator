@@ -1,4 +1,4 @@
-# Codex / CC 编排规则
+# 点将台：Codex / CC 编排规则
 
 实际执行以 [Skill](../skills/codex-sol-claude-orchestrator/SKILL.md) 为准；困难算法/建模、视觉、关键瓶颈或修复无效时才读 [条件参考](../skills/codex-sol-claude-orchestrator/references/capability-boundaries.md)。
 
