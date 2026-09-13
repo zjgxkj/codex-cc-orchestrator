@@ -1,4 +1,4 @@
-"""Claude-Agent MCP: a STDIO MCP server that lets Codex/Sol delegate scoped
+"""Claude-Agent MCP: a STDIO MCP server that lets Codex delegate scoped
 coding tasks to Claude Code via the Claude Agent SDK.
 
 Entrypoints:

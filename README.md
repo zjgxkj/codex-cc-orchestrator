@@ -230,6 +230,11 @@ provide a trusted `project_root` for each new job (or rely on explicitly
 configured `ALLOWED_PROJECT_ROOTS`) and must orchestrate task/review/resume
 calls itself. The bundled orchestration Skill is Codex-specific and is optional.
 
+For adapting the server or orchestration rules to a different coordinator/worker
+pair, see [AGENT_PORTING.md](AGENT_PORTING.md). It includes a capability checklist,
+preserved invariants, migration steps, and a prompt that can be given directly to
+the target agent.
+
 ## Status: v0.3 hardened
 
 See `CODEX_CLAUDE_AGENT_MCP_SPEC.md` §25 for the full checklist. All v1 items are

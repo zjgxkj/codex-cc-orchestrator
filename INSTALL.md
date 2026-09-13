@@ -171,6 +171,10 @@ Result，也可以使用；新 job 必须由客户端传入可信 `project_root`
 `ALLOWED_PROJECT_ROOTS`。Codex 编排 Skill 不会在其他 Agent 中自动生效，任务、
 review 与 resume 的调用顺序需由其客户端负责。
 
+若执行端也不是 Claude Code，或希望换成另一组“编排 Agent → 执行 Agent”，请把
+[`AGENT_PORTING.md`](AGENT_PORTING.md) 直接交给负责迁移的 Agent；其中区分了只换
+编排端、只换执行端和两端都换三种情况。
+
 ---
 
 ## 5. 配置项参考（环境变量）
