@@ -1,0 +1,30 @@
+[project]
+name = "codex-claude-agent-mcp"
+version = "0.3.0"
+description = "STDIO MCP server that lets Codex/Sol delegate scoped coding tasks to Claude Code via the Claude Agent SDK."
+readme = "README.md"
+authors = [
+    { name = "Project contributors" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "claude-agent-sdk>=0.2.136,<0.3.0",
+    "mcp>=1.29.0,<2.0.0",
+]
+
+[project.scripts]
+codex-claude-agent-mcp = "codex_claude_agent_mcp:main"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
