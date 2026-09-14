@@ -33,8 +33,8 @@
 
 ```bash
 # 如果你还没拿到代码
-git clone https://github.com/zjgxkj/codex-claude-agent-mcp.git codex-claude-agent-mcp
-cd codex-claude-agent-mcp
+git clone https://github.com/zjgxkj/codex-cc-orchestrator.git
+cd codex-cc-orchestrator
 
 # 创建虚拟环境并安装依赖（mcp + claude-agent-sdk）
 uv sync

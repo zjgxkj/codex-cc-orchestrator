@@ -96,8 +96,8 @@ Server 在启动执行或审查前分配 UUID，只有执行端回报相同 sess
 [INSTALL.md](INSTALL.md)。
 
 ```bash
-git clone https://github.com/zjgxkj/codex-claude-agent-mcp.git
-cd codex-claude-agent-mcp
+git clone https://github.com/zjgxkj/codex-cc-orchestrator.git
+cd codex-cc-orchestrator
 git checkout v0.4.0
 uv sync
 ```
